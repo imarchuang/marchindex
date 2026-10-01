@@ -1,0 +1,10 @@
+services:
+  marchindex:
+    build: .
+    ports:
+      - "9200:9200"
+    volumes:
+      - marchindex-data:/data
+
+volumes:
+  marchindex-data:
