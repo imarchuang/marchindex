@@ -136,24 +136,100 @@ func removeDocID(ids []uint32, id uint32) []uint32 {
 	return ids[:len(ids)-1]
 }
 
-func (r *RAMIndex) search(n *qNode, limit int) SearchResult {
+// snapshotFrozen copies the live buffer and remaps docIDs to 0..n-1.
+// The caller writes that copy, then dropFrozen removes the original rows.
+func (r *RAMIndex) snapshotFrozen() *frozen {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.docs) == 0 {
+		return nil
+	}
+
+	orig := make([]uint32, 0, len(r.docs))
+	for id := range r.docs {
+		orig = append(orig, id)
+	}
+	sort.Slice(orig, func(i, j int) bool { return orig[i] < orig[j] })
+
+	remap := make(map[uint32]uint32, len(orig))
+	docs := make([]map[string]string, len(orig))
+	idAt := make(map[string]uint32, len(orig))
+	for newID, old := range orig {
+		remap[old] = uint32(newID)
+		docs[newID] = cloneMap(r.docs[old])
+		idAt[r.docs[old]["_id"]] = old
+	}
+
+	postings := make(map[string][]uint32, len(r.postings))
+	for term, list := range r.postings {
+		out := make([]uint32, 0, len(list))
+		for _, old := range list {
+			if nid, ok := remap[old]; ok {
+				out = append(out, nid)
+			}
+		}
+		if len(out) > 0 {
+			postings[term] = out
+		}
+	}
+	return &frozen{
+		docs:       docs,
+		postings:   postings,
+		origDocIDs: orig,
+		idAt:       idAt,
+	}
+}
+
+// dropFrozen removes rows that were committed, if they are still the current
+// version of that _id. A replacement indexed during the file write stays.
+func (r *RAMIndex) dropFrozen(f *frozen) {
+	if f == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, old := range f.origDocIDs {
+		if _, ok := r.docs[old]; !ok {
+			continue
+		}
+		r.dropLocked(old)
+	}
+	for id, old := range f.idAt {
+		if r.idToDoc[id] == old {
+			delete(r.idToDoc, id)
+		}
+	}
+	if len(r.docs) == 0 {
+		r.nextDoc = 0
+		r.postings = make(map[string][]uint32)
+		r.docs = make(map[uint32]map[string]string)
+		r.docTerms = make(map[uint32][]string)
+	}
+}
+
+// match evaluates n against the RAM buffer. Lookups count even when limit
+// fetches nothing. An empty buffer reports zero lookups so a flushed index
+// is not charged for an idle buffer.
+func (r *RAMIndex) match(n *qNode, limit int) (hits []map[string]string, docIDs []uint32, lookups int) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-
-	var lookups int
+	if len(r.docs) == 0 {
+		return nil, nil, 0
+	}
 	ids := n.eval(r.postings, &lookups)
 	if limit > len(ids) {
 		limit = len(ids)
 	}
-	hits := make([]map[string]string, 0, limit)
+	if limit < 0 {
+		limit = 0
+	}
+	hits = make([]map[string]string, 0, limit)
+	docIDs = make([]uint32, 0, limit)
 	for _, id := range ids[:limit] {
 		hits = append(hits, cloneMap(r.docs[id]))
+		docIDs = append(docIDs, id)
 	}
-	return SearchResult{
-		Hits:            hits,
-		PostingsLookups: lookups,
-		DocsExamined:    len(hits),
-	}
+	return hits, docIDs, lookups
 }
 
 func (idx *Index) storedDocs() []map[string]string {
