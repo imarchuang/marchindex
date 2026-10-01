@@ -1,0 +1,19 @@
+# Compiled binaries
+/marchindex
+*.exe
+*.out
+
+# Go test/coverage artifacts
+*.test
+*.prof
+coverage.txt
+
+# Runtime data directory
+/data/
+
+# macOS junk
+.DS_Store
+
+# Editor dirs
+.idea/
+.vscode/
