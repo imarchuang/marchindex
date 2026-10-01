@@ -52,10 +52,12 @@ type IndexInfo struct {
 	SegmentCount int    `json:"segment_count"`
 }
 
-// Index represents an index on disk.
+// Index is a named index: its on-disk directory plus the RAM inverted index
+// searched until a later slice flushes immutable segments.
 type Index struct {
 	name    string
 	baseDir string
+	ram     *RAMIndex
 }
 
 // Name returns the index name.
@@ -82,6 +84,9 @@ func (idx *Index) SegmentsFilePath() string {
 type Manager struct {
 	dataDir string
 	mu      sync.RWMutex
+	// ram is the unflushed inverted index for each name. Slice 1 searches
+	// only this buffer; segments.json stays an empty commit point.
+	ram map[string]*RAMIndex
 }
 
 // NewManager creates a new Manager instance pointing to dataDir.
@@ -92,6 +97,7 @@ func NewManager(dataDir string) (*Manager, error) {
 	}
 	return &Manager{
 		dataDir: dataDir,
+		ram:     make(map[string]*RAMIndex),
 	}, nil
 }
 
@@ -142,23 +148,28 @@ func (m *Manager) CreateIndex(name string) (*Index, error) {
 		return nil, fmt.Errorf("commit segments.json: %w", err)
 	}
 
+	ram := newRAMIndex()
+	m.ram[name] = ram
 	return &Index{
 		name:    name,
 		baseDir: idxDir,
+		ram:     ram,
 	}, nil
 }
 
 // GetIndex retrieves an existing index by name.
+// The returned Index shares the process-local RAM buffer for that name.
 func (m *Manager) GetIndex(name string) (*Index, error) {
 	if err := ValidateIndexName(name); err != nil {
 		return nil, err
 	}
 
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	idxDir := filepath.Join(m.dataDir, "indices", name)
 	fi, err := os.Stat(idxDir)
+	ram := m.ram[name]
+	m.mu.RUnlock()
+
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrIndexNotFound
@@ -169,9 +180,24 @@ func (m *Manager) GetIndex(name string) (*Index, error) {
 		return nil, ErrIndexNotFound
 	}
 
+	if ram == nil {
+		// Disk index from a previous process has no unflushed buffer yet.
+		m.mu.Lock()
+		ram = m.ram[name]
+		if ram == nil {
+			ram = newRAMIndex()
+			if m.ram == nil {
+				m.ram = make(map[string]*RAMIndex)
+			}
+			m.ram[name] = ram
+		}
+		m.mu.Unlock()
+	}
+
 	return &Index{
 		name:    name,
 		baseDir: idxDir,
+		ram:     ram,
 	}, nil
 }
 
