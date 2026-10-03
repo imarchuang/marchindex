@@ -41,9 +41,26 @@ func ValidateIndexName(name string) error {
 	return nil
 }
 
-// CommitPoint represents the contents of segments.json, the active commit point.
+// SegmentRef is one immutable segment listed in the commit point.
+// Readers ignore segment directories that are not in this list.
+type SegmentRef struct {
+	ID         string `json:"id"`
+	Generation uint64 `json:"generation"`
+}
+
+// CommitPoint is segments.json. Readers see a segment only after this file
+// has been atomically replaced to include it.
 type CommitPoint struct {
-	Segments []any `json:"segments"`
+	Generation uint64       `json:"generation"`
+	Segments   []SegmentRef `json:"segments"`
+}
+
+// indexLive is the process-local state shared by every handle for one index.
+// mu serializes flush (writer) with search (reader) so a search never observes
+// a new commit point together with the RAM docs that were just frozen into it.
+type indexLive struct {
+	mu  sync.RWMutex
+	ram *RAMIndex
 }
 
 // IndexInfo provides basic metadata for listing indices.
@@ -52,11 +69,12 @@ type IndexInfo struct {
 	SegmentCount int    `json:"segment_count"`
 }
 
-// Index is a named index: its on-disk directory plus the RAM inverted index
-// searched until a later slice flushes immutable segments.
+// Index is a named index: its on-disk directory plus the shared RAM buffer.
+// Search reads committed segments and, for near-real-time hits, the RAM buffer.
 type Index struct {
 	name    string
 	baseDir string
+	live    *indexLive
 	ram     *RAMIndex
 }
 
@@ -84,9 +102,7 @@ func (idx *Index) SegmentsFilePath() string {
 type Manager struct {
 	dataDir string
 	mu      sync.RWMutex
-	// ram is the unflushed inverted index for each name. Slice 1 searches
-	// only this buffer; segments.json stays an empty commit point.
-	ram map[string]*RAMIndex
+	live    map[string]*indexLive
 }
 
 // NewManager creates a new Manager instance pointing to dataDir.
@@ -97,7 +113,7 @@ func NewManager(dataDir string) (*Manager, error) {
 	}
 	return &Manager{
 		dataDir: dataDir,
-		ram:     make(map[string]*RAMIndex),
+		live:    make(map[string]*indexLive),
 	}, nil
 }
 
@@ -130,7 +146,7 @@ func (m *Manager) CreateIndex(name string) (*Index, error) {
 	commitPath := filepath.Join(idxDir, "segments.json")
 	tmpPath := filepath.Join(idxDir, "segments.json.tmp")
 
-	cp := CommitPoint{Segments: []any{}}
+	cp := CommitPoint{Segments: []SegmentRef{}}
 	data, err := json.MarshalIndent(cp, "", "  ")
 	if err != nil {
 		_ = os.RemoveAll(idxDir)
@@ -148,17 +164,19 @@ func (m *Manager) CreateIndex(name string) (*Index, error) {
 		return nil, fmt.Errorf("commit segments.json: %w", err)
 	}
 
-	ram := newRAMIndex()
-	m.ram[name] = ram
+	live := &indexLive{ram: newRAMIndex()}
+	m.live[name] = live
 	return &Index{
 		name:    name,
 		baseDir: idxDir,
-		ram:     ram,
+		live:    live,
+		ram:     live.ram,
 	}, nil
 }
 
 // GetIndex retrieves an existing index by name.
 // The returned Index shares the process-local RAM buffer for that name.
+// A new process starts with an empty buffer and serves search from segments.json.
 func (m *Manager) GetIndex(name string) (*Index, error) {
 	if err := ValidateIndexName(name); err != nil {
 		return nil, err
@@ -167,7 +185,7 @@ func (m *Manager) GetIndex(name string) (*Index, error) {
 	m.mu.RLock()
 	idxDir := filepath.Join(m.dataDir, "indices", name)
 	fi, err := os.Stat(idxDir)
-	ram := m.ram[name]
+	live := m.live[name]
 	m.mu.RUnlock()
 
 	if err != nil {
@@ -180,16 +198,16 @@ func (m *Manager) GetIndex(name string) (*Index, error) {
 		return nil, ErrIndexNotFound
 	}
 
-	if ram == nil {
+	if live == nil {
 		// Disk index from a previous process has no unflushed buffer yet.
 		m.mu.Lock()
-		ram = m.ram[name]
-		if ram == nil {
-			ram = newRAMIndex()
-			if m.ram == nil {
-				m.ram = make(map[string]*RAMIndex)
+		live = m.live[name]
+		if live == nil {
+			live = &indexLive{ram: newRAMIndex()}
+			if m.live == nil {
+				m.live = make(map[string]*indexLive)
 			}
-			m.ram[name] = ram
+			m.live[name] = live
 		}
 		m.mu.Unlock()
 	}
@@ -197,7 +215,8 @@ func (m *Manager) GetIndex(name string) (*Index, error) {
 	return &Index{
 		name:    name,
 		baseDir: idxDir,
-		ram:     ram,
+		live:    live,
+		ram:     live.ram,
 	}, nil
 }
 

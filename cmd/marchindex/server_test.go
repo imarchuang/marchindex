@@ -380,6 +380,71 @@ func TestDocAndSearchErrors(t *testing.T) {
 	}
 }
 
+func TestFlushSearchAndRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(mgr)
+
+	req := httptest.NewRequest(http.MethodPut, "/indices/logs", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	postDoc(t, server, "/indices/logs/_doc", `{"service":"api","level":"error","message":"timeout calling db"}`, http.StatusCreated)
+	postDoc(t, server, "/indices/logs/_doc", `{"service":"api","level":"info","message":"request ok"}`, http.StatusCreated)
+
+	flushRec := httptest.NewRecorder()
+	server.ServeHTTP(flushRec, httptest.NewRequest(http.MethodPost, "/indices/logs/_flush", nil))
+	if flushRec.Code != http.StatusOK {
+		t.Fatalf("flush: %d %s", flushRec.Code, flushRec.Body.String())
+	}
+	var flushed index.FlushResult
+	if err := json.Unmarshal(flushRec.Body.Bytes(), &flushed); err != nil {
+		t.Fatal(err)
+	}
+	if !flushed.Flushed || flushed.Segment != "seg-000001" || flushed.Docs != 2 {
+		t.Fatalf("flush = %+v", flushed)
+	}
+
+	segDir := filepath.Join(tmpDir, "indices", "logs", "segments", "seg-000001")
+	for _, name := range []string{"terms.bin", "postings.bin", "docs.bin", "docs.idx", "meta.json"} {
+		if _, err := os.Stat(filepath.Join(segDir, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+
+	mgr2, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server2 := NewServer(mgr2)
+	raw := searchRaw(t, server2, "level:error AND service:api", "")
+	var result struct {
+		Hits             []map[string]string `json:"hits"`
+		PostingsLookups  int                 `json:"postings_lookups"`
+		SegmentsSearched int                 `json:"segments_searched"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Hits) != 1 || result.Hits[0]["_id"] != "1" || result.Hits[0]["_seg"] != "seg-000001" {
+		t.Fatalf("restart hits = %#v", result.Hits)
+	}
+	if result.SegmentsSearched != 1 || result.PostingsLookups != 2 {
+		t.Fatalf("stats = %+v", result)
+	}
+
+	missing := httptest.NewRecorder()
+	server2.ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/indices/missing/_flush", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing flush status = %d", missing.Code)
+	}
+}
+
 func postDoc(t *testing.T, server http.Handler, path, body string, want int) index.IndexResult {
 	t.Helper()
 	rec := httptest.NewRecorder()

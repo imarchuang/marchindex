@@ -19,14 +19,14 @@ Endpoints:
   PUT    /indices/{name}               - create index
   GET    /indices                      - list indices + segment counts
   POST   /indices/{name}/_doc          - index one JSON document (RAM; searchable without flush)
+  POST   /indices/{name}/_flush        - freeze RAM into an immutable segment and commit it
   POST   /indices/{name}/_bulk         - NDJSON bulk (optional polish)
-  POST   /indices/{name}/_flush        - RAM -> new segment + commit
   DELETE /indices/{name}/_doc/{id}     - mark deleted (bitset)
   GET    /indices/{name}/_search       - boolean search, q= and limit= (default 10)
   POST   /indices/{name}/_forcemerge   - compact segments now
   GET    /indices/{name}/_stats        - docs, segments, terms, deletes
 
-Query string (q), answered from the RAM index:
+Query string (q), answered from committed segments and the unflushed RAM buffer:
   level:error              term in field "level"
   timeout                  term in the default field "message"
   a AND b                  intersection (AND binds tighter than OR)
@@ -115,6 +115,19 @@ func NewServer(mgr *index.Manager) http.Handler {
 			status = http.StatusOK
 		}
 		writeJSON(w, status, res)
+	})
+
+	mux.HandleFunc("POST /indices/{name}/_flush", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := openIndex(w, mgr, r.PathValue("name"))
+		if !ok {
+			return
+		}
+		res, err := idx.Flush()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
 	})
 
 	mux.HandleFunc("GET /indices/{name}/_search", func(w http.ResponseWriter, r *http.Request) {

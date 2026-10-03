@@ -2,23 +2,29 @@ package index
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 )
 
 // SearchResult is the boolean search response.
 // DocsExamined counts stored documents fetched after the postings combine.
-// PostingsLookups counts term postings-list lookups, one per query term.
+// PostingsLookups counts term postings-list lookups. Each committed segment
+// and a non-empty RAM buffer contributes one lookup per query term.
+// SegmentsSearched is the number of segments listed in the commit point.
 type SearchResult struct {
-	Hits            []map[string]string `json:"hits"`
-	TookMs          int64               `json:"took_ms"`
-	PostingsLookups int                 `json:"postings_lookups"`
-	DocsExamined    int                 `json:"docs_examined"`
+	Hits             []map[string]string `json:"hits"`
+	TookMs           int64               `json:"took_ms"`
+	PostingsLookups  int                 `json:"postings_lookups"`
+	DocsExamined     int                 `json:"docs_examined"`
+	SegmentsSearched int                 `json:"segments_searched"`
 }
 
-// Search parses q and runs it against the in-memory index.
-// limit caps how many stored docs are fetched, in increasing docID order.
+// Search parses q and runs it against every committed segment, then the
+// unflushed RAM buffer. limit caps how many stored docs are fetched.
+// Segment hits come first, in commit order and increasing local docID;
+// RAM hits follow in increasing docID.
 func (idx *Index) Search(q string, limit int) (SearchResult, error) {
-	if idx == nil || idx.ram == nil {
+	if idx == nil || idx.live == nil || idx.ram == nil {
 		return SearchResult{}, fmt.Errorf("index is not open")
 	}
 	if limit < 0 {
@@ -29,9 +35,50 @@ func (idx *Index) Search(q string, limit int) (SearchResult, error) {
 	if err != nil {
 		return SearchResult{}, err
 	}
-	res := idx.ram.search(node, limit)
-	res.TookMs = time.Since(start).Milliseconds()
-	return res, nil
+
+	idx.live.mu.RLock()
+	defer idx.live.mu.RUnlock()
+
+	segs, err := readCommittedSegments(idx.baseDir)
+	if err != nil {
+		return SearchResult{}, err
+	}
+
+	var lookups int
+	hits := make([]map[string]string, 0)
+	remaining := limit
+	for _, seg := range segs {
+		ids := node.eval(seg.postings, &lookups)
+		for _, id := range ids {
+			if remaining == 0 {
+				break
+			}
+			doc, err := seg.fetch(id)
+			if err != nil {
+				return SearchResult{}, err
+			}
+			doc["_seg"] = seg.id
+			doc["_doc"] = strconv.FormatUint(uint64(id), 10)
+			hits = append(hits, doc)
+			remaining--
+		}
+	}
+
+	ramHits, ramDocs, ramLookups := idx.ram.match(node, remaining)
+	lookups += ramLookups
+	for i, doc := range ramHits {
+		doc["_seg"] = "_ram"
+		doc["_doc"] = strconv.FormatUint(uint64(ramDocs[i]), 10)
+		hits = append(hits, doc)
+	}
+
+	return SearchResult{
+		Hits:             hits,
+		TookMs:           time.Since(start).Milliseconds(),
+		PostingsLookups:  lookups,
+		DocsExamined:     len(hits),
+		SegmentsSearched: len(segs),
+	}, nil
 }
 
 // eval combines postings for n. Each term list is copied so the result
