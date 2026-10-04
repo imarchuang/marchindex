@@ -19,8 +19,12 @@ var ErrBadQuery = errors.New("invalid query")
 //	( ... )       grouping
 //	"a b"         adjacent positions in the default field
 //	field:"a b"   adjacent positions in that field
+//	term~N        same field, Levenshtein distance at most N (0, 1, or 2)
+//	field:term~N  same, limited to that field
 //
 // NOT is rejected so it is not parsed as something else.
+// Distance applies to the analyzed term, not the "field:" prefix.
+// A phrase is not fuzzy.
 
 type qKind int
 
@@ -29,6 +33,7 @@ const (
 	qPhrase
 	qAnd
 	qOr
+	qFuzzy
 )
 
 // phraseTerm is one indexed token in a phrase. delta is its position minus
@@ -43,6 +48,7 @@ type qNode struct {
 	kind   qKind
 	field  string
 	term   string
+	fuzz   int // max Levenshtein distance for qFuzzy; 0 is an exact term
 	phrase []phraseTerm
 	kids   []*qNode
 }
@@ -51,7 +57,7 @@ func (n *qNode) termCount() int {
 	if n == nil {
 		return 0
 	}
-	if n.kind == qTerm {
+	if n.kind == qTerm || n.kind == qFuzzy {
 		return 1
 	}
 	if n.kind == qPhrase {
@@ -69,6 +75,22 @@ func (n *qNode) matches(terms map[string]struct{}) bool {
 	case qTerm:
 		_, ok := terms[scopedTerm(n.field, n.term)]
 		return ok
+	case qFuzzy:
+		if n.fuzz == 0 {
+			_, ok := terms[scopedTerm(n.field, n.term)]
+			return ok
+		}
+		prefix := scopedTerm(n.field, "")
+		for key := range terms {
+			term, ok := strings.CutPrefix(key, prefix)
+			if !ok {
+				continue
+			}
+			if withinEditDistance(n.term, term, n.fuzz) {
+				return true
+			}
+		}
+		return false
 	case qAnd:
 		for _, k := range n.kids {
 			if !k.matches(terms) {
@@ -340,14 +362,46 @@ func termNode(raw string) (*qNode, error) {
 	if value == "" {
 		return nil, badQueryf("missing term in %q", raw)
 	}
+	value, fuzz, err := splitFuzzy(value)
+	if err != nil {
+		return nil, err
+	}
+	if value == "" {
+		return nil, badQueryf("missing term in %q", raw)
+	}
 	tokens := Analyze(value)
 	switch len(tokens) {
 	case 0:
 		return nil, badQueryf("term %q is below the minimum length of %d", raw, minTokenLen)
 	case 1:
-		return &qNode{kind: qTerm, field: field, term: tokens[0]}, nil
+		if fuzz < 0 {
+			return &qNode{kind: qTerm, field: field, term: tokens[0]}, nil
+		}
+		return &qNode{kind: qFuzzy, field: field, term: tokens[0], fuzz: fuzz}, nil
 	default:
 		return nil, badQueryf("term %q produces multiple tokens; use AND or OR between single terms", raw)
+	}
+}
+
+// splitFuzzy peels a trailing ~0, ~1, or ~2 off a term. A value with no '~'
+// returns fuzz -1 so the caller builds an exact term.
+func splitFuzzy(value string) (string, int, error) {
+	i := strings.LastIndexByte(value, '~')
+	if i < 0 {
+		return value, -1, nil
+	}
+	if i == 0 || strings.ContainsRune(value[:i], '~') {
+		return "", 0, badQueryf("fuzzy distance must be 0, 1, or 2")
+	}
+	switch value[i+1:] {
+	case "0":
+		return value[:i], 0, nil
+	case "1":
+		return value[:i], 1, nil
+	case "2":
+		return value[:i], 2, nil
+	default:
+		return "", 0, badQueryf("fuzzy distance must be 0, 1, or 2")
 	}
 }
 
