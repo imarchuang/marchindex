@@ -11,7 +11,9 @@ import (
 // SearchResult is the boolean search response.
 // DocsExamined counts stored documents fetched after the postings combine.
 // PostingsLookups counts term postings-list lookups. Each committed segment
-// and a non-empty RAM buffer contributes one lookup per query term.
+// and a non-empty RAM buffer contributes one lookup per exact query term.
+// A fuzzy term with distance 0 does the same. A wider fuzzy term contributes
+// one lookup per dictionary term within that distance; zero matches add none.
 // SegmentsSearched is the number of segments listed in the commit point.
 type SearchResult struct {
 	Hits             []map[string]string `json:"hits"`
@@ -154,6 +156,8 @@ func (n *qNode) eval(postings map[string][]docPosting, lookups *int) []uint32 {
 	case qTerm:
 		*lookups++
 		return append([]uint32(nil), postingIDs(postings[scopedTerm(n.field, n.term)])...)
+	case qFuzzy:
+		return fuzzyDocs(postings, n.field, n.term, n.fuzz, lookups)
 	case qPhrase:
 		return phraseDocs(postings, n.field, n.phrase, lookups)
 	case qAnd:
@@ -292,6 +296,22 @@ func (n *qNode) score(postings map[string][]docPosting, doc uint32) int {
 			return 0
 		}
 		return len(p.pos)
+	case qFuzzy:
+		if n.fuzz == 0 {
+			p, ok := findPosting(postings[scopedTerm(n.field, n.term)], doc)
+			if !ok {
+				return 0
+			}
+			return len(p.pos)
+		}
+		total := 0
+		for _, key := range fuzzyTermKeys(postings, n.field, n.term, n.fuzz) {
+			p, ok := findPosting(postings[key], doc)
+			if ok {
+				total += len(p.pos)
+			}
+		}
+		return total
 	case qPhrase:
 		return phraseScore(postings, n.field, n.phrase, doc)
 	case qAnd, qOr:

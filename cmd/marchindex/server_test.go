@@ -66,6 +66,7 @@ func TestRootHelpHandler(t *testing.T) {
 		"searchable without flush",
 		"default field \"message\"",
 		"AND binds tighter than OR",
+		"timeot~1",
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(body, sub) {
@@ -538,6 +539,33 @@ func TestPhraseSearchHTTP(t *testing.T) {
 	raw := searchRaw(t, server, `"timeout calling"`, "")
 	if !strings.Contains(string(raw), `"timeout calling db"`) || strings.Contains(string(raw), `"timeout db"`) {
 		t.Fatalf("phrase hits = %s", raw)
+	}
+}
+
+func TestFuzzySearchHTTP(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(mgr)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/indices/logs", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d", rec.Code)
+	}
+	postDoc(t, server, "/indices/logs/_doc", `{"_id":"near","message":"timeout calling db"}`, http.StatusCreated)
+	postDoc(t, server, "/indices/logs/_doc", `{"_id":"other","message":"disk full"}`, http.StatusCreated)
+
+	raw := searchRaw(t, server, "timeot~1", "")
+	if !strings.Contains(string(raw), `"near"`) || strings.Contains(string(raw), `"other"`) {
+		t.Fatalf("fuzzy hits = %s", raw)
+	}
+
+	bad := httptest.NewRecorder()
+	server.ServeHTTP(bad, httptest.NewRequest(http.MethodGet, "/indices/logs/_search?q="+url.QueryEscape("timeot~3"), nil))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("timeot~3 status = %d: %s", bad.Code, bad.Body.String())
 	}
 }
 

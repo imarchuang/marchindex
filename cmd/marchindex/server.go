@@ -39,7 +39,9 @@ Query string (q), answered from committed segments and the unflushed RAM buffer:
   (a OR b) AND c           parentheses
   "timeout calling"        adjacent tokens in the default field "message"
   message:"timeout db"     adjacent tokens in field "message"
-NOT queries are not supported.
+  timeot~1                 terms within edit distance 1 (0, 1, or 2)
+  level:eror~1             same, limited to that field
+NOT queries are not supported. Phrases are not fuzzy.
 `
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
