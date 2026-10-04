@@ -16,7 +16,7 @@ import (
 //
 //	meta.json     doc count, term count, created_ns
 //	terms.bin     sorted term dictionary pointing into postings.bin
-//	postings.bin  one delta-encoded docID list per term
+//	postings.bin  one delta-encoded docID list per term, with positions
 //	docs.bin      stored field JSON, one record per local docID
 //	docs.idx      docID → byte offset of that record in docs.bin
 //
@@ -30,9 +30,14 @@ import (
 //
 //	magic "MXPO" | version uint32
 //	then blobs addressed by terms.bin. Each blob is:
-//	  count uvarint | docID0 uvarint | delta1 uvarint | delta2 ...
-//	The first value is the docID. Every later value is a strictly positive
-//	difference from the previous docID.
+//	  count uvarint
+//	  repeated per document:
+//	    docDelta uvarint | freq uvarint | pos0 uvarint | posDelta uvarint ...
+//	docDelta is the docID for the first document and a strictly positive
+//	difference after that. freq is the number of positions. pos0 is the first
+//	position in the field; later positions are strictly positive differences.
+//	A position counts every token in the field, including tokens that are too
+//	short to index, so a dropped token still leaves a gap.
 //
 // docs.bin
 //
@@ -52,7 +57,9 @@ const (
 	postingsMagic = "MXPO"
 	docsMagic     = "MXDC"
 	docsIdxMagic  = "MXDI"
-	formatVersion = 1
+	// Version 2 stores a position list after each docID. Version 1 segments
+	// have docIDs only and cannot answer phrase queries.
+	formatVersion = 2
 )
 
 type segmentMeta struct {
@@ -67,7 +74,7 @@ type segmentMeta struct {
 // through docs.idx.
 type segment struct {
 	id       string
-	postings map[string][]uint32
+	postings map[string][]docPosting
 	docs     []byte
 	docOff   []uint64
 	// deleted is nil when the segment has no deleted.bits file.
@@ -251,7 +258,7 @@ func (s *segment) liveIDs(ids []uint32) []uint32 {
 	return out
 }
 
-func writeSegment(dir, id string, docs []map[string]string, postings map[string][]uint32, created time.Time) error {
+func writeSegment(dir, id string, docs []map[string]string, postings map[string][]docPosting, created time.Time) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create segment dir: %w", err)
 	}
@@ -293,7 +300,7 @@ func writeSegment(dir, id string, docs []map[string]string, postings map[string]
 	return syncDir(dir)
 }
 
-func encodeDictionary(postings map[string][]uint32) (terms, posts []byte, err error) {
+func encodeDictionary(postings map[string][]docPosting) (terms, posts []byte, err error) {
 	names := make([]string, 0, len(postings))
 	for term := range postings {
 		names = append(names, term)
@@ -341,7 +348,7 @@ func encodeDictionary(postings map[string][]uint32) (terms, posts []byte, err er
 	return terms, posts, nil
 }
 
-func decodeTermDictionary(terms, posts []byte) (map[string][]uint32, error) {
+func decodeTermDictionary(terms, posts []byte) (map[string][]docPosting, error) {
 	if err := checkHeader(terms, termsMagic); err != nil {
 		return nil, err
 	}
@@ -355,7 +362,7 @@ func decodeTermDictionary(terms, posts []byte) (map[string][]uint32, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string][]uint32, count)
+	out := make(map[string][]docPosting, count)
 	var prev string
 	for i := uint32(0); i < count; i++ {
 		// Use = rather than := so the cursor b stays in this function's block.
@@ -393,14 +400,14 @@ func decodeTermDictionary(terms, posts []byte) (map[string][]uint32, error) {
 		if off > uint64(len(posts)) || end > uint64(len(posts)) {
 			return nil, fmt.Errorf("term %q postings offset out of range", name)
 		}
-		ids, err := decodePostings(posts[off:end])
+		list, err := decodePostings(posts[off:end])
 		if err != nil {
 			return nil, fmt.Errorf("term %q: %w", name, err)
 		}
-		if uint32(len(ids)) != df {
-			return nil, fmt.Errorf("term %q: df %d, decoded %d", name, df, len(ids))
+		if uint32(len(list)) != df {
+			return nil, fmt.Errorf("term %q: df %d, decoded %d", name, df, len(list))
 		}
-		out[name] = ids
+		out[name] = list
 	}
 	if len(b) != 0 {
 		return nil, fmt.Errorf("trailing bytes in terms.bin")
@@ -408,27 +415,45 @@ func decodeTermDictionary(terms, posts []byte) (map[string][]uint32, error) {
 	return out, nil
 }
 
-func encodePostings(ids []uint32) ([]byte, error) {
+func encodePostings(list []docPosting) ([]byte, error) {
 	var buf []byte
-	buf = binary.AppendUvarint(buf, uint64(len(ids)))
-	var prev uint32
-	for i, id := range ids {
+	buf = binary.AppendUvarint(buf, uint64(len(list)))
+	var prevDoc uint32
+	for i, p := range list {
+		if len(p.pos) == 0 {
+			return nil, fmt.Errorf("doc %d has no positions", p.doc)
+		}
 		var delta uint64
 		if i == 0 {
-			delta = uint64(id)
+			delta = uint64(p.doc)
 		} else {
-			if id <= prev {
+			if p.doc <= prevDoc {
 				return nil, fmt.Errorf("docIDs are not strictly increasing")
 			}
-			delta = uint64(id - prev)
+			delta = uint64(p.doc - prevDoc)
 		}
-		prev = id
+		prevDoc = p.doc
 		buf = binary.AppendUvarint(buf, delta)
+		buf = binary.AppendUvarint(buf, uint64(len(p.pos)))
+		var prevPos uint32
+		for j, pos := range p.pos {
+			var pd uint64
+			if j == 0 {
+				pd = uint64(pos)
+			} else {
+				if pos <= prevPos {
+					return nil, fmt.Errorf("doc %d positions are not strictly increasing", p.doc)
+				}
+				pd = uint64(pos - prevPos)
+			}
+			prevPos = pos
+			buf = binary.AppendUvarint(buf, pd)
+		}
 	}
 	return buf, nil
 }
 
-func decodePostings(b []byte) ([]uint32, error) {
+func decodePostings(b []byte) ([]docPosting, error) {
 	n, k := binary.Uvarint(b)
 	if k <= 0 {
 		return nil, fmt.Errorf("postings count")
@@ -437,8 +462,8 @@ func decodePostings(b []byte) ([]uint32, error) {
 	if n > uint64(len(b)) {
 		return nil, fmt.Errorf("postings count too large")
 	}
-	out := make([]uint32, 0, n)
-	var prev uint32
+	out := make([]docPosting, 0, n)
+	var prevDoc uint32
 	for i := uint64(0); i < n; i++ {
 		d, k := binary.Uvarint(b)
 		if k <= 0 {
@@ -448,20 +473,54 @@ func decodePostings(b []byte) ([]uint32, error) {
 		if d > math.MaxUint32 {
 			return nil, fmt.Errorf("postings delta overflows uint32")
 		}
-		var id uint32
+		var doc uint32
 		if i == 0 {
-			id = uint32(d)
+			doc = uint32(d)
 		} else {
 			if d == 0 {
 				return nil, fmt.Errorf("postings delta must be positive")
 			}
-			id = prev + uint32(d)
-			if id <= prev {
+			doc = prevDoc + uint32(d)
+			if doc <= prevDoc {
 				return nil, fmt.Errorf("postings docID overflow")
 			}
 		}
-		out = append(out, id)
-		prev = id
+		prevDoc = doc
+		freq, k := binary.Uvarint(b)
+		if k <= 0 {
+			return nil, fmt.Errorf("doc %d position count", doc)
+		}
+		b = b[k:]
+		if freq == 0 || freq > uint64(len(b)) {
+			return nil, fmt.Errorf("doc %d position count %d", doc, freq)
+		}
+		pos := make([]uint32, 0, freq)
+		var prevPos uint32
+		for j := uint64(0); j < freq; j++ {
+			pd, k := binary.Uvarint(b)
+			if k <= 0 {
+				return nil, fmt.Errorf("doc %d position", doc)
+			}
+			b = b[k:]
+			if pd > math.MaxUint32 {
+				return nil, fmt.Errorf("doc %d position overflows uint32", doc)
+			}
+			var at uint32
+			if j == 0 {
+				at = uint32(pd)
+			} else {
+				if pd == 0 {
+					return nil, fmt.Errorf("doc %d position delta must be positive", doc)
+				}
+				at = prevPos + uint32(pd)
+				if at <= prevPos {
+					return nil, fmt.Errorf("doc %d position overflow", doc)
+				}
+			}
+			prevPos = at
+			pos = append(pos, at)
+		}
+		out = append(out, docPosting{doc: doc, pos: pos})
 	}
 	if len(b) != 0 {
 		return nil, fmt.Errorf("trailing bytes in postings")

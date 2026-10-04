@@ -118,8 +118,8 @@ func (idx *Index) mergeLocked(minSegments int) (MergeResult, error) {
 // mergeSegments assigns fresh local docIDs in commit order, skipping deletes.
 // Postings from later segments receive higher docIDs, so appending them keeps
 // each list strictly increasing.
-func mergeSegments(segs []*segment) (docs []map[string]string, postings map[string][]uint32, dropped int, err error) {
-	postings = make(map[string][]uint32)
+func mergeSegments(segs []*segment) (docs []map[string]string, postings map[string][]docPosting, dropped int, err error) {
+	postings = make(map[string][]docPosting)
 	for _, seg := range segs {
 		remap := make(map[uint32]uint32, len(seg.docOff))
 		for old := range seg.docOff {
@@ -137,11 +137,11 @@ func mergeSegments(segs []*segment) (docs []map[string]string, postings map[stri
 		}
 		for term, list := range seg.postings {
 			for _, old := range list {
-				newID, ok := remap[old]
+				newID, ok := remap[old.doc]
 				if !ok {
 					continue
 				}
-				postings[term] = append(postings[term], newID)
+				postings[term] = append(postings[term], clonePosting(old, newID))
 			}
 		}
 	}

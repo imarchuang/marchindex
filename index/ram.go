@@ -14,8 +14,8 @@ import (
 type RAMIndex struct {
 	mu sync.RWMutex
 
-	// postings maps "field:term" to a strictly increasing docID list.
-	postings map[string][]uint32
+	// postings maps "field:term" to docIDs with positions, docIDs strictly increasing.
+	postings map[string][]docPosting
 	// docs is the doc store: docID → original field map, including _id.
 	docs map[uint32]map[string]string
 	// docTerms records the terms written for a docID.
@@ -39,7 +39,7 @@ type IndexResult struct {
 
 func newRAMIndex() *RAMIndex {
 	return &RAMIndex{
-		postings: make(map[string][]uint32),
+		postings: make(map[string][]docPosting),
 		docs:     make(map[uint32]map[string]string),
 		docTerms: make(map[uint32][]string),
 		idToDoc:  make(map[string]uint32),
@@ -75,9 +75,9 @@ func (r *RAMIndex) add(id string, fields map[string]string) (IndexResult, error)
 	docID := r.nextDoc
 	r.nextDoc++
 
-	terms := FieldTerms(fields)
+	terms, positions := FieldPositions(fields)
 	for _, term := range terms {
-		r.postings[term] = append(r.postings[term], docID)
+		r.postings[term] = append(r.postings[term], docPosting{doc: docID, pos: positions[term]})
 	}
 	if terms == nil {
 		terms = []string{}
@@ -126,7 +126,7 @@ func (r *RAMIndex) deleteID(id string) bool {
 	delete(r.idToDoc, id)
 	if len(r.docs) == 0 {
 		r.nextDoc = 0
-		r.postings = make(map[string][]uint32)
+		r.postings = make(map[string][]docPosting)
 		r.docs = make(map[uint32]map[string]string)
 		r.docTerms = make(map[uint32][]string)
 	}
@@ -135,7 +135,7 @@ func (r *RAMIndex) deleteID(id string) bool {
 
 func (r *RAMIndex) dropLocked(docID uint32) {
 	for _, term := range r.docTerms[docID] {
-		list := removeDocID(r.postings[term], docID)
+		list := removeDocPosting(r.postings[term], docID)
 		if len(list) == 0 {
 			delete(r.postings, term)
 		} else {
@@ -146,13 +146,13 @@ func (r *RAMIndex) dropLocked(docID uint32) {
 	delete(r.docs, docID)
 }
 
-func removeDocID(ids []uint32, id uint32) []uint32 {
-	i := sort.Search(len(ids), func(j int) bool { return ids[j] >= id })
-	if i == len(ids) || ids[i] != id {
-		return ids
+func removeDocPosting(list []docPosting, id uint32) []docPosting {
+	i := sort.Search(len(list), func(j int) bool { return list[j].doc >= id })
+	if i == len(list) || list[i].doc != id {
+		return list
 	}
-	copy(ids[i:], ids[i+1:])
-	return ids[:len(ids)-1]
+	copy(list[i:], list[i+1:])
+	return list[:len(list)-1]
 }
 
 // snapshotFrozen copies the live buffer and remaps docIDs to 0..n-1.
@@ -179,12 +179,12 @@ func (r *RAMIndex) snapshotFrozen() *frozen {
 		idAt[r.docs[old]["_id"]] = old
 	}
 
-	postings := make(map[string][]uint32, len(r.postings))
+	postings := make(map[string][]docPosting, len(r.postings))
 	for term, list := range r.postings {
-		out := make([]uint32, 0, len(list))
+		out := make([]docPosting, 0, len(list))
 		for _, old := range list {
-			if nid, ok := remap[old]; ok {
-				out = append(out, nid)
+			if nid, ok := remap[old.doc]; ok {
+				out = append(out, clonePosting(old, nid))
 			}
 		}
 		if len(out) > 0 {
@@ -220,7 +220,7 @@ func (r *RAMIndex) dropFrozen(f *frozen) {
 	}
 	if len(r.docs) == 0 {
 		r.nextDoc = 0
-		r.postings = make(map[string][]uint32)
+		r.postings = make(map[string][]docPosting)
 		r.docs = make(map[uint32]map[string]string)
 		r.docTerms = make(map[uint32][]string)
 	}
@@ -282,13 +282,18 @@ func (idx *Index) checkPostings() error {
 	defer r.mu.RUnlock()
 	for term, list := range r.postings {
 		for i := 1; i < len(list); i++ {
-			if list[i] <= list[i-1] {
+			if list[i].doc <= list[i-1].doc {
 				return fmt.Errorf("postings %q are not strictly increasing", term)
 			}
 		}
-		for _, id := range list {
-			if _, ok := r.docs[id]; !ok {
-				return fmt.Errorf("postings %q reference missing doc %d", term, id)
+		for _, p := range list {
+			if _, ok := r.docs[p.doc]; !ok {
+				return fmt.Errorf("postings %q reference missing doc %d", term, p.doc)
+			}
+			for j := 1; j < len(p.pos); j++ {
+				if p.pos[j] <= p.pos[j-1] {
+					return fmt.Errorf("postings %q doc %d positions are not strictly increasing", term, p.doc)
+				}
 			}
 		}
 	}
