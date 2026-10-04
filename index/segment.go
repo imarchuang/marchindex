@@ -70,6 +70,9 @@ type segment struct {
 	postings map[string][]uint32
 	docs     []byte
 	docOff   []uint64
+	// deleted is nil when the segment has no deleted.bits file.
+	// A set bit means that local docID is skipped until merge rewrites the segment.
+	deleted []byte
 }
 
 func (s *segment) fetch(docID uint32) (map[string]string, error) {
@@ -210,13 +213,42 @@ func openSegment(dir, id string) (*segment, error) {
 	if int(docsCount) != meta.Docs {
 		return nil, fmt.Errorf("segment %s: docs.bin count %d, meta %d", id, docsCount, meta.Docs)
 	}
+	deleted, err := readDeletedBits(filepath.Join(dir, "deleted.bits"), meta.Docs)
+	if err != nil {
+		return nil, fmt.Errorf("segment %s: %w", id, err)
+	}
 
 	return &segment{
 		id:       id,
 		postings: postings,
 		docs:     docsFile,
 		docOff:   docOff,
+		deleted:  deleted,
 	}, nil
+}
+
+func (s *segment) isDeleted(docID uint32) bool {
+	if s == nil || int(docID) >= len(s.docOff) {
+		return false
+	}
+	byteIndex := int(docID / 8)
+	if byteIndex >= len(s.deleted) {
+		return false
+	}
+	return s.deleted[byteIndex]&(1<<uint(docID%8)) != 0
+}
+
+func (s *segment) liveIDs(ids []uint32) []uint32 {
+	if len(s.deleted) == 0 {
+		return ids
+	}
+	out := make([]uint32, 0, len(ids))
+	for _, id := range ids {
+		if !s.isDeleted(id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func writeSegment(dir, id string, docs []map[string]string, postings map[string][]uint32, created time.Time) error {

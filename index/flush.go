@@ -81,6 +81,12 @@ func (idx *Index) Flush() (FlushResult, error) {
 	}
 	idx.ram.dropFrozen(snap)
 
+	// Three committed segments is enough to show the background merge.
+	// Two flushes stay unmerged so a caller can still see each segment.
+	if _, err := idx.mergeLocked(autoMergeAt); err != nil {
+		return FlushResult{}, err
+	}
+
 	return FlushResult{
 		Flushed:    true,
 		Segment:    id,

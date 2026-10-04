@@ -19,6 +19,8 @@ var (
 	ErrIndexExists = errors.New("index already exists")
 	// ErrIndexNotFound is returned when an index does not exist.
 	ErrIndexNotFound = errors.New("index not found")
+	// ErrDocNotFound is returned when delete finds no live copy of an _id.
+	ErrDocNotFound = errors.New("document not found")
 
 	validNamePattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
 )

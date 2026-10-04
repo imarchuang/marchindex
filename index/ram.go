@@ -114,6 +114,25 @@ func (r *RAMIndex) assignIDLocked(id string) (string, error) {
 	}
 }
 
+// deleteID drops the live RAM copy of id. A committed copy is untouched.
+func (r *RAMIndex) deleteID(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	docID, ok := r.idToDoc[id]
+	if !ok {
+		return false
+	}
+	r.dropLocked(docID)
+	delete(r.idToDoc, id)
+	if len(r.docs) == 0 {
+		r.nextDoc = 0
+		r.postings = make(map[string][]uint32)
+		r.docs = make(map[uint32]map[string]string)
+		r.docTerms = make(map[uint32][]string)
+	}
+	return true
+}
+
 func (r *RAMIndex) dropLocked(docID uint32) {
 	for _, term := range r.docTerms[docID] {
 		list := removeDocID(r.postings[term], docID)

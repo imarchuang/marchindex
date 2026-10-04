@@ -445,6 +445,65 @@ func TestFlushSearchAndRestart(t *testing.T) {
 	}
 }
 
+func TestDeleteAndForceMergeHTTP(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(mgr)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/indices/logs", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d", rec.Code)
+	}
+	postDoc(t, server, "/indices/logs/_doc", `{"_id":"a","level":"error","message":"timeout"}`, http.StatusCreated)
+	flushRec := httptest.NewRecorder()
+	server.ServeHTTP(flushRec, httptest.NewRequest(http.MethodPost, "/indices/logs/_flush", nil))
+	if flushRec.Code != http.StatusOK {
+		t.Fatalf("flush a: %d %s", flushRec.Code, flushRec.Body.String())
+	}
+	postDoc(t, server, "/indices/logs/_doc", `{"_id":"b","level":"info","message":"ok"}`, http.StatusCreated)
+	flushRec = httptest.NewRecorder()
+	server.ServeHTTP(flushRec, httptest.NewRequest(http.MethodPost, "/indices/logs/_flush", nil))
+	if flushRec.Code != http.StatusOK {
+		t.Fatalf("flush b: %d %s", flushRec.Code, flushRec.Body.String())
+	}
+
+	del := httptest.NewRecorder()
+	server.ServeHTTP(del, httptest.NewRequest(http.MethodDelete, "/indices/logs/_doc/a", nil))
+	if del.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", del.Code, del.Body.String())
+	}
+	raw := searchRaw(t, server, "level:error", "")
+	if strings.Contains(string(raw), `"_id":"a"`) {
+		t.Fatalf("deleted hit still present: %s", raw)
+	}
+
+	mergeRec := httptest.NewRecorder()
+	server.ServeHTTP(mergeRec, httptest.NewRequest(http.MethodPost, "/indices/logs/_forcemerge", nil))
+	if mergeRec.Code != http.StatusOK {
+		t.Fatalf("merge: %d %s", mergeRec.Code, mergeRec.Body.String())
+	}
+	var merged index.MergeResult
+	if err := json.Unmarshal(mergeRec.Body.Bytes(), &merged); err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Merged || merged.SegmentsAfter != 1 || merged.Dropped != 1 {
+		t.Fatalf("merge = %+v", merged)
+	}
+	raw = searchRaw(t, server, "level:info", "")
+	if !strings.Contains(string(raw), `"_id":"b"`) {
+		t.Fatalf("kept doc missing: %s", raw)
+	}
+
+	missing := httptest.NewRecorder()
+	server.ServeHTTP(missing, httptest.NewRequest(http.MethodDelete, "/indices/logs/_doc/a", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("second delete = %d", missing.Code)
+	}
+}
+
 func postDoc(t *testing.T, server http.Handler, path, body string, want int) index.IndexResult {
 	t.Helper()
 	rec := httptest.NewRecorder()
