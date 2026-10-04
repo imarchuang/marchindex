@@ -99,6 +99,10 @@ func readDeletedBits(path string, nDocs int) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("deleted.bits: %w", err)
 	}
+	return decodeDeletedBits(data, nDocs)
+}
+
+func decodeDeletedBits(data []byte, nDocs int) ([]byte, error) {
 	if err := checkHeader(data, deletedMagic); err != nil {
 		return nil, fmt.Errorf("deleted.bits: %w", err)
 	}

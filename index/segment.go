@@ -69,9 +69,9 @@ type segmentMeta struct {
 	CreatedNs int64  `json:"created_ns"`
 }
 
-// segment is a committed immutable segment loaded for search.
-// Postings are decoded once. Stored docs stay in docs.bin and are fetched
-// through docs.idx.
+// segment is the eager representation used by maintenance (merge/delete).
+// It loads all postings and stored document bytes. Search uses segmentReader
+// instead, reading only selected postings and document ranges.
 type segment struct {
 	id       string
 	postings map[string][]docPosting
@@ -348,11 +348,36 @@ func encodeDictionary(postings map[string][]docPosting) (terms, posts []byte, er
 	return terms, posts, nil
 }
 
+type termRef struct {
+	offset uint64
+	length uint32
+	df     uint32
+}
+
 func decodeTermDictionary(terms, posts []byte) (map[string][]docPosting, error) {
-	if err := checkHeader(terms, termsMagic); err != nil {
+	if err := checkHeader(posts, postingsMagic); err != nil {
 		return nil, err
 	}
-	if err := checkHeader(posts, postingsMagic); err != nil {
+	refs, err := decodeTermRefs(terms, uint64(len(posts)))
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]docPosting, len(refs))
+	for name, ref := range refs {
+		list, err := decodePostings(posts[ref.offset : ref.offset+uint64(ref.length)])
+		if err != nil {
+			return nil, fmt.Errorf("term %q: %w", name, err)
+		}
+		if uint32(len(list)) != ref.df {
+			return nil, fmt.Errorf("term %q: df %d, decoded %d", name, ref.df, len(list))
+		}
+		out[name] = list
+	}
+	return out, nil
+}
+
+func decodeTermRefs(terms []byte, postingsSize uint64) (map[string]termRef, error) {
+	if err := checkHeader(terms, termsMagic); err != nil {
 		return nil, err
 	}
 	b := terms[8:]
@@ -362,7 +387,10 @@ func decodeTermDictionary(terms, posts []byte) (map[string][]docPosting, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string][]docPosting, count)
+	if uint64(count) > uint64(len(b))/20 {
+		return nil, fmt.Errorf("term count too large")
+	}
+	out := make(map[string]termRef, count)
 	var prev string
 	for i := uint32(0); i < count; i++ {
 		// Use = rather than := so the cursor b stays in this function's block.
@@ -396,18 +424,10 @@ func decodeTermDictionary(terms, posts []byte) (map[string][]docPosting, error) 
 			return nil, fmt.Errorf("terms are not strictly sorted at %q", name)
 		}
 		prev = name
-		end := off + uint64(length)
-		if off > uint64(len(posts)) || end > uint64(len(posts)) {
+		if off < 8 || off > postingsSize || uint64(length) > postingsSize-off || length == 0 {
 			return nil, fmt.Errorf("term %q postings offset out of range", name)
 		}
-		list, err := decodePostings(posts[off:end])
-		if err != nil {
-			return nil, fmt.Errorf("term %q: %w", name, err)
-		}
-		if uint32(len(list)) != df {
-			return nil, fmt.Errorf("term %q: df %d, decoded %d", name, df, len(list))
-		}
-		out[name] = list
+		out[name] = termRef{offset: off, length: length, df: df}
 	}
 	if len(b) != 0 {
 		return nil, fmt.Errorf("trailing bytes in terms.bin")
@@ -559,6 +579,9 @@ func decodeDocsIndex(b []byte) ([]uint64, error) {
 	count, rest, err := takeU32(rest)
 	if err != nil {
 		return nil, err
+	}
+	if uint64(count) > uint64(len(rest))/12 {
+		return nil, fmt.Errorf("docs.idx count too large")
 	}
 	off := make([]uint64, count)
 	for i := uint32(0); i < count; i++ {

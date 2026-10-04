@@ -16,6 +16,7 @@ import (
 // one lookup per dictionary term within that distance; zero matches add none.
 // SegmentsSearched is the number of segments listed in the commit point.
 type SearchResult struct {
+	IO               SearchIO            `json:"io"`
 	Hits             []map[string]string `json:"hits"`
 	TookMs           int64               `json:"took_ms"`
 	PostingsLookups  int                 `json:"postings_lookups"`
@@ -53,10 +54,16 @@ func (idx *Index) search(q string, limit int, rankTF bool) (SearchResult, error)
 	idx.live.mu.RLock()
 	defer idx.live.mu.RUnlock()
 
-	segs, err := readCommittedSegments(idx.baseDir)
+	var ioStats SearchIO
+	segs, err := readSearchSegments(idx.baseDir, &ioStats)
 	if err != nil {
 		return SearchResult{}, err
 	}
+	defer func() {
+		for _, seg := range segs {
+			seg.close()
+		}
+	}()
 
 	var lookups int
 	type candidate struct {
@@ -65,13 +72,17 @@ func (idx *Index) search(q string, limit int, rankTF bool) (SearchResult, error)
 	}
 	var cands []candidate
 	for _, seg := range segs {
-		ids := seg.liveIDs(node.eval(seg.postings, &lookups))
+		postings, err := seg.queryPostings(node)
+		if err != nil {
+			return SearchResult{}, err
+		}
+		ids := seg.liveIDs(node.eval(postings, &lookups))
 		for _, id := range ids {
 			id := id
 			seg := seg
 			score := 0
 			if rankTF {
-				score = node.score(seg.postings, id)
+				score = node.score(postings, id)
 			}
 			cands = append(cands, candidate{
 				score: score,
@@ -138,6 +149,7 @@ func (idx *Index) search(q string, limit int, rankTF bool) (SearchResult, error)
 	}
 
 	return SearchResult{
+		IO:               ioStats,
 		Hits:             hits,
 		TookMs:           time.Since(start).Milliseconds(),
 		PostingsLookups:  lookups,

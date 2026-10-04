@@ -101,6 +101,45 @@ repeated per document:
 `docs.bin` holds the original field JSON. `docs.idx` maps each local docID to
 the byte offset of that record.
 
+## Selective search reads
+
+Search uses a request-scoped `segmentReader`, not the eager `openSegment`
+used by merge/delete. The on-disk format is unchanged.
+
+1. Read `segments.json`, segment metadata, `terms.bin`, `docs.idx`, deletion
+   bits and the small postings/docs headers. Validate counts and offsets.
+2. Resolve exact/phrase query terms in the dictionary. Fuzzy queries scan
+   dictionary keys and select only terms within the requested edit distance.
+3. Use `ReadAt(postOff, postLen)` for each distinct selected postings list.
+   Decode it once per segment per request; boolean evaluation and TF scoring
+   reuse it. An absent term reads no postings payload.
+4. Combine docIDs, filter deleted documents, and apply ordering and `limit`.
+5. Fetch only returned documents with `ReadAt`. A record ends at the next
+   `docs.idx` offset (or EOF for the last document). No document payload is
+   read for a miss or `limit=0`, although query postings are still evaluated.
+
+Each response includes an `io` object:
+
+- `metadata_bytes_read`: commit point, metadata, dictionary, offsets, deletion
+  bits and file headers read during this request.
+- `postings_bytes_read`: selected compressed postings payload bytes.
+- `docs_bytes_read`: selected stored records, including their length prefixes.
+- `postings_decoded`: distinct postings lists decoded; repeated query terms
+  do not cause repeated reads. Unlike `postings_lookups`, this counts physical
+  list decodes rather than logical query lookups.
+
+Byte counters measure bytes returned by application file reads, **not physical
+storage I/O**: the OS page cache may serve them. `docs_examined` still counts
+returned documents, including RAM hits; it is not an I/O metric.
+
+Readers close their file handles on success and error, before releasing the
+index read lock. Flush/merge/delete retain the existing exclusive lock, so
+readers cannot race segment removal or deletion-bit replacement. No reader
+cache survives the request: each search still loads the full dictionary and
+current deletion bits. This avoids stale readers, but metadata caching and
+non-blocking merge remain future optimizations. Unselected payload corruption
+is discovered only when that payload is read (or during eager maintenance).
+
 ## Delete
 
 `DELETE` does not rewrite postings. It sets a bit in `deleted.bits` for that
