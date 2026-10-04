@@ -229,11 +229,17 @@ func (r *RAMIndex) dropFrozen(f *frozen) {
 // match evaluates n against the RAM buffer. Lookups count even when limit
 // fetches nothing. An empty buffer reports zero lookups so a flushed index
 // is not charged for an idle buffer.
-func (r *RAMIndex) match(n *qNode, limit int) (hits []map[string]string, docIDs []uint32, lookups int) {
+func (r *RAMIndex) liveCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.docs)
+}
+
+func (r *RAMIndex) match(n *qNode, limit int) (hits []map[string]string, docIDs []uint32, scores []int, lookups int) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if len(r.docs) == 0 {
-		return nil, nil, 0
+		return nil, nil, nil, 0
 	}
 	ids := n.eval(r.postings, &lookups)
 	if limit > len(ids) {
@@ -244,11 +250,13 @@ func (r *RAMIndex) match(n *qNode, limit int) (hits []map[string]string, docIDs 
 	}
 	hits = make([]map[string]string, 0, limit)
 	docIDs = make([]uint32, 0, limit)
+	scores = make([]int, 0, limit)
 	for _, id := range ids[:limit] {
 		hits = append(hits, cloneMap(r.docs[id]))
 		docIDs = append(docIDs, id)
+		scores = append(scores, n.score(r.postings, id))
 	}
-	return hits, docIDs, lookups
+	return hits, docIDs, scores, lookups
 }
 
 func (idx *Index) storedDocs() []map[string]string {

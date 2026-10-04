@@ -2,6 +2,7 @@ package index
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"time"
@@ -25,6 +26,16 @@ type SearchResult struct {
 // Segment hits come first, in commit order and increasing local docID;
 // RAM hits follow in increasing docID.
 func (idx *Index) Search(q string, limit int) (SearchResult, error) {
+	return idx.search(q, limit, false)
+}
+
+// SearchTF is Search, then orders matches by the sum of matching term
+// frequencies. Ties keep commit order. The response field _score is that sum.
+func (idx *Index) SearchTF(q string, limit int) (SearchResult, error) {
+	return idx.search(q, limit, true)
+}
+
+func (idx *Index) search(q string, limit int, rankTF bool) (SearchResult, error) {
 	if idx == nil || idx.live == nil || idx.ram == nil {
 		return SearchResult{}, fmt.Errorf("index is not open")
 	}
@@ -46,30 +57,81 @@ func (idx *Index) Search(q string, limit int) (SearchResult, error) {
 	}
 
 	var lookups int
-	hits := make([]map[string]string, 0)
-	remaining := limit
+	type candidate struct {
+		fetch func() (map[string]string, error)
+		score int
+	}
+	var cands []candidate
 	for _, seg := range segs {
 		ids := seg.liveIDs(node.eval(seg.postings, &lookups))
 		for _, id := range ids {
-			if remaining == 0 {
-				break
+			id := id
+			seg := seg
+			score := 0
+			if rankTF {
+				score = node.score(seg.postings, id)
 			}
-			doc, err := seg.fetch(id)
-			if err != nil {
-				return SearchResult{}, err
-			}
-			doc["_seg"] = seg.id
-			doc["_doc"] = strconv.FormatUint(uint64(id), 10)
-			hits = append(hits, doc)
-			remaining--
+			cands = append(cands, candidate{
+				score: score,
+				fetch: func() (map[string]string, error) {
+					doc, err := seg.fetch(id)
+					if err != nil {
+						return nil, err
+					}
+					doc["_seg"] = seg.id
+					doc["_doc"] = strconv.FormatUint(uint64(id), 10)
+					if rankTF {
+						doc["_score"] = strconv.Itoa(score)
+					}
+					return doc, nil
+				},
+			})
 		}
 	}
 
-	ramHits, ramDocs, ramLookups := idx.ram.match(node, remaining)
+	ramLimit := limit
+	if rankTF {
+		ramLimit = math.MaxInt
+	}
+	ramHits, ramDocs, ramScores, ramLookups := idx.ram.match(node, ramLimit)
 	lookups += ramLookups
 	for i, doc := range ramHits {
-		doc["_seg"] = "_ram"
-		doc["_doc"] = strconv.FormatUint(uint64(ramDocs[i]), 10)
+		i := i
+		doc := doc
+		score := 0
+		if rankTF {
+			score = ramScores[i]
+		}
+		cands = append(cands, candidate{
+			score: score,
+			fetch: func() (map[string]string, error) {
+				doc["_seg"] = "_ram"
+				doc["_doc"] = strconv.FormatUint(uint64(ramDocs[i]), 10)
+				if rankTF {
+					doc["_score"] = strconv.Itoa(score)
+				}
+				return doc, nil
+			},
+		})
+	}
+
+	if rankTF {
+		sort.SliceStable(cands, func(i, j int) bool {
+			return cands[i].score > cands[j].score
+		})
+	} else if limit < len(cands) {
+		cands = cands[:limit]
+	}
+	if rankTF && limit < len(cands) {
+		cands = cands[:limit]
+	}
+
+	hits := make([]map[string]string, 0, len(cands))
+	for _, cand := range cands {
+		doc, err := cand.fetch()
+		if err != nil {
+			return SearchResult{}, err
+		}
 		hits = append(hits, doc)
 	}
 
@@ -215,4 +277,66 @@ func phraseAligned(lists [][]docPosting, idx []int, phrase []phraseTerm) bool {
 func hasPos(pos []uint32, want uint32) bool {
 	i := sort.Search(len(pos), func(j int) bool { return pos[j] >= want })
 	return i < len(pos) && pos[i] == want
+}
+
+// score is the sum of term frequencies for the terms that contribute to a
+// match. A phrase contributes how many times it occurs in the document.
+func (n *qNode) score(postings map[string][]docPosting, doc uint32) int {
+	if n == nil {
+		return 0
+	}
+	switch n.kind {
+	case qTerm:
+		p, ok := findPosting(postings[scopedTerm(n.field, n.term)], doc)
+		if !ok {
+			return 0
+		}
+		return len(p.pos)
+	case qPhrase:
+		return phraseScore(postings, n.field, n.phrase, doc)
+	case qAnd, qOr:
+		total := 0
+		for _, k := range n.kids {
+			total += k.score(postings, doc)
+		}
+		return total
+	default:
+		return 0
+	}
+}
+
+func findPosting(list []docPosting, doc uint32) (docPosting, bool) {
+	i := sort.Search(len(list), func(j int) bool { return list[j].doc >= doc })
+	if i < len(list) && list[i].doc == doc {
+		return list[i], true
+	}
+	return docPosting{}, false
+}
+
+func phraseScore(postings map[string][]docPosting, field string, phrase []phraseTerm, doc uint32) int {
+	if len(phrase) == 0 {
+		return 0
+	}
+	pos := make([][]uint32, len(phrase))
+	for i, term := range phrase {
+		p, ok := findPosting(postings[scopedTerm(field, term.term)], doc)
+		if !ok {
+			return 0
+		}
+		pos[i] = p.pos
+	}
+	n := 0
+	for _, start := range pos[0] {
+		ok := true
+		for i := 1; i < len(phrase); i++ {
+			if !hasPos(pos[i], start+phrase[i].delta) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			n++
+		}
+	}
+	return n
 }
