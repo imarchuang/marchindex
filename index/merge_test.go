@@ -49,8 +49,8 @@ func TestDeleteSkipsUntilMergeDrops(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !equalU32(decoded["level:error"], []uint32{0}) {
-		t.Fatalf("postings after delete = %v, want the doc kept until merge", decoded["level:error"])
+	if !equalU32(postingIDs(decoded["level:error"]), []uint32{0}) {
+		t.Fatalf("postings after delete = %v, want the doc kept until merge", postingIDs(decoded["level:error"]))
 	}
 	if _, err := os.Stat(filepath.Join(idx.SegmentsDir(), "seg-000001", "deleted.bits")); err != nil {
 		t.Fatal(err)
@@ -92,8 +92,8 @@ func TestDeleteSkipsUntilMergeDrops(t *testing.T) {
 	if _, ok := decoded["level:error"]; ok {
 		t.Fatal("merged postings still contain the deleted term")
 	}
-	if !equalU32(decoded["level:info"], []uint32{0}) {
-		t.Fatalf("level:info = %v", decoded["level:info"])
+	if !equalU32(postingIDs(decoded["level:info"]), []uint32{0}) {
+		t.Fatalf("level:info = %v", postingIDs(decoded["level:info"]))
 	}
 
 	list, err := mgr.ListIndices()

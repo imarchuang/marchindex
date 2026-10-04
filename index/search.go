@@ -2,6 +2,7 @@ package index
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -83,17 +84,16 @@ func (idx *Index) Search(q string, limit int) (SearchResult, error) {
 
 // eval combines postings for n. Each term list is copied so the result
 // does not alias the live index.
-func (n *qNode) eval(postings map[string][]uint32, lookups *int) []uint32 {
+func (n *qNode) eval(postings map[string][]docPosting, lookups *int) []uint32 {
 	if n == nil {
 		return nil
 	}
 	switch n.kind {
 	case qTerm:
 		*lookups++
-		src := postings[scopedTerm(n.field, n.term)]
-		out := make([]uint32, len(src))
-		copy(out, src)
-		return out
+		return append([]uint32(nil), postingIDs(postings[scopedTerm(n.field, n.term)])...)
+	case qPhrase:
+		return phraseDocs(postings, n.field, n.phrase, lookups)
 	case qAnd:
 		if len(n.kids) == 0 {
 			return nil
@@ -155,4 +155,64 @@ func union(a, b []uint32) []uint32 {
 	out = append(out, a[i:]...)
 	out = append(out, b[j:]...)
 	return out
+}
+
+// phraseDocs returns documents where each phrase term occurs at
+// firstPosition+delta. A delta of 1 means the next term is the next token.
+func phraseDocs(postings map[string][]docPosting, field string, phrase []phraseTerm, lookups *int) []uint32 {
+	if len(phrase) == 0 {
+		return nil
+	}
+	lists := make([][]docPosting, len(phrase))
+	for i, term := range phrase {
+		*lookups++
+		lists[i] = postings[scopedTerm(field, term.term)]
+	}
+	for _, list := range lists {
+		if len(list) == 0 {
+			return nil
+		}
+	}
+	var out []uint32
+	idx := make([]int, len(lists))
+	for idx[0] < len(lists[0]) {
+		doc := lists[0][idx[0]].doc
+		aligned := true
+		for i := 1; i < len(lists); i++ {
+			for idx[i] < len(lists[i]) && lists[i][idx[i]].doc < doc {
+				idx[i]++
+			}
+			if idx[i] >= len(lists[i]) || lists[i][idx[i]].doc != doc {
+				aligned = false
+				break
+			}
+		}
+		if aligned && phraseAligned(lists, idx, phrase) {
+			out = append(out, doc)
+		}
+		idx[0]++
+	}
+	return out
+}
+
+func phraseAligned(lists [][]docPosting, idx []int, phrase []phraseTerm) bool {
+	first := lists[0][idx[0]].pos
+	for _, start := range first {
+		ok := true
+		for i := 1; i < len(phrase); i++ {
+			if !hasPos(lists[i][idx[i]].pos, start+phrase[i].delta) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPos(pos []uint32, want uint32) bool {
+	i := sort.Search(len(pos), func(j int) bool { return pos[j] >= want })
+	return i < len(pos) && pos[i] == want
 }

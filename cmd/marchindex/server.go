@@ -32,7 +32,9 @@ Query string (q), answered from committed segments and the unflushed RAM buffer:
   a AND b                  intersection (AND binds tighter than OR)
   a OR b                   union
   (a OR b) AND c           parentheses
-NOT and phrase queries are not supported.
+  "timeout calling"        adjacent tokens in the default field "message"
+  message:"timeout db"     adjacent tokens in field "message"
+NOT queries are not supported.
 `
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

@@ -364,7 +364,7 @@ func TestDocAndSearchErrors(t *testing.T) {
 		{name: "invalid json", method: http.MethodPost, path: "/indices/logs/_doc", body: `{`},
 		{name: "nested", method: http.MethodPost, path: "/indices/logs/_doc", body: `{"level":{"a":"b"}}`},
 		{name: "bad name", method: http.MethodPost, path: "/indices/Logs/_doc", body: `{"level":"error"}`},
-		{name: "phrase", method: http.MethodGet, path: "/indices/logs/_search?q=" + url.QueryEscape(`"timeout db"`)},
+		{name: "unclosed phrase", method: http.MethodGet, path: "/indices/logs/_search?q=" + url.QueryEscape(`"timeout db`)},
 		{name: "not", method: http.MethodGet, path: "/indices/logs/_search?q=" + url.QueryEscape("NOT level:error")},
 		{name: "bad limit", method: http.MethodGet, path: "/indices/logs/_search?q=timeout&limit=-1"},
 		{name: "limit type", method: http.MethodGet, path: "/indices/logs/_search?q=timeout&limit=abc"},
@@ -442,6 +442,27 @@ func TestFlushSearchAndRestart(t *testing.T) {
 	server2.ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/indices/missing/_flush", nil))
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing flush status = %d", missing.Code)
+	}
+}
+
+func TestPhraseSearchHTTP(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(mgr)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/indices/logs", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d", rec.Code)
+	}
+	postDoc(t, server, "/indices/logs/_doc", `{"message":"timeout calling db"}`, http.StatusCreated)
+	postDoc(t, server, "/indices/logs/_doc", `{"message":"timeout db"}`, http.StatusCreated)
+
+	raw := searchRaw(t, server, `"timeout calling"`, "")
+	if !strings.Contains(string(raw), `"timeout calling db"`) || strings.Contains(string(raw), `"timeout db"`) {
+		t.Fatalf("phrase hits = %s", raw)
 	}
 }
 

@@ -345,7 +345,8 @@ func TestRejectUnsupportedQueries(t *testing.T) {
 		q    string
 		sub  string
 	}{
-		{name: "phrase", q: `"timeout db"`, sub: "phrase"},
+		{name: "unclosed phrase", q: `"timeout db`, sub: "unclosed"},
+		{name: "one term phrase", q: `"timeout"`, sub: "at least two"},
 		{name: "not", q: "NOT level:error", sub: "NOT"},
 		{name: "minus", q: "-level:error", sub: "NOT"},
 		{name: "bang", q: "!level:error", sub: "NOT"},

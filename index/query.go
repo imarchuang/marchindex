@@ -17,22 +17,34 @@ var ErrBadQuery = errors.New("invalid query")
 //	a AND b       intersection; AND binds tighter than OR
 //	a OR b        union
 //	( ... )       grouping
+//	"a b"         adjacent positions in the default field
+//	field:"a b"   adjacent positions in that field
 //
-// NOT and phrase queries are rejected so they are not parsed as something else.
+// NOT is rejected so it is not parsed as something else.
 
 type qKind int
 
 const (
 	qTerm qKind = iota
+	qPhrase
 	qAnd
 	qOr
 )
 
-type qNode struct {
-	kind  qKind
-	field string
+// phraseTerm is one indexed token in a phrase. delta is its position minus
+// the position of the first indexed token, so a short token in between
+// leaves a gap greater than 1.
+type phraseTerm struct {
 	term  string
-	kids  []*qNode
+	delta uint32
+}
+
+type qNode struct {
+	kind   qKind
+	field  string
+	term   string
+	phrase []phraseTerm
+	kids   []*qNode
 }
 
 func (n *qNode) termCount() int {
@@ -41,6 +53,9 @@ func (n *qNode) termCount() int {
 	}
 	if n.kind == qTerm {
 		return 1
+	}
+	if n.kind == qPhrase {
+		return len(n.phrase)
 	}
 	total := 0
 	for _, k := range n.kids {
@@ -86,11 +101,13 @@ const (
 	tokOR
 	tokLParen
 	tokRParen
+	tokPhrase
 )
 
 type token struct {
-	kind tokKind
-	text string
+	kind  tokKind
+	text  string
+	field string
 }
 
 func (t token) String() string {
@@ -114,9 +131,6 @@ func (t token) String() string {
 }
 
 func parseQuery(q string) (*qNode, error) {
-	if strings.Contains(q, `"`) {
-		return nil, badQueryf("phrase queries are not supported")
-	}
 	q = strings.TrimSpace(q)
 	if q == "" {
 		return nil, badQueryf("query is empty")
@@ -157,10 +171,32 @@ func lex(input string) ([]token, error) {
 			toks = append(toks, token{kind: tokRParen, text: ")"})
 			i++
 			continue
+		case '"':
+			body, next, err := readQuoted(runes, i)
+			if err != nil {
+				return nil, err
+			}
+			toks = append(toks, token{kind: tokPhrase, text: body})
+			i = next
+			continue
 		}
 		start := i
-		for i < len(runes) && !unicode.IsSpace(runes[i]) && runes[i] != '(' && runes[i] != ')' {
+		for i < len(runes) && !unicode.IsSpace(runes[i]) && runes[i] != '(' && runes[i] != ')' && runes[i] != '"' {
 			i++
+		}
+		if i < len(runes) && runes[i] == '"' {
+			word := string(runes[start:i])
+			if !strings.HasSuffix(word, ":") || word == ":" {
+				return nil, badQueryf("unexpected quote")
+			}
+			field := strings.TrimSuffix(word, ":")
+			body, next, err := readQuoted(runes, i)
+			if err != nil {
+				return nil, err
+			}
+			toks = append(toks, token{kind: tokPhrase, text: body, field: field})
+			i = next
+			continue
 		}
 		word := string(runes[start:i])
 		switch strings.ToUpper(word) {
@@ -180,6 +216,20 @@ func lex(input string) ([]token, error) {
 		}
 	}
 	return toks, nil
+}
+
+func readQuoted(runes []rune, open int) (string, int, error) {
+	var body []rune
+	for j := open + 1; j < len(runes); j++ {
+		if runes[j] == '"' {
+			if len(body) == 0 {
+				return "", 0, badQueryf("empty phrase")
+			}
+			return string(body), j + 1, nil
+		}
+		body = append(body, runes[j])
+	}
+	return "", 0, badQueryf("unclosed phrase")
 }
 
 type parser struct {
@@ -262,6 +312,9 @@ func (p *parser) parsePrimary() (*qNode, error) {
 	case tokTerm:
 		p.next()
 		return termNode(t.text)
+	case tokPhrase:
+		p.next()
+		return phraseNode(t.field, t.text)
 	case tokAND, tokOR:
 		return nil, badQueryf("unexpected operator %s", strings.ToUpper(t.text))
 	case tokRParen:
@@ -296,4 +349,30 @@ func termNode(raw string) (*qNode, error) {
 	default:
 		return nil, badQueryf("term %q produces multiple tokens; use AND or OR between single terms", raw)
 	}
+}
+
+func phraseNode(field, raw string) (*qNode, error) {
+	if field == "" {
+		field = DefaultField
+	}
+	if strings.HasPrefix(raw, "-") || strings.HasPrefix(raw, "!") {
+		return nil, badQueryf("NOT queries are not supported")
+	}
+	var phrase []phraseTerm
+	var origin uint32
+	seenKept := false
+	for _, tok := range analyzePositions(raw) {
+		if len([]rune(tok.text)) < minTokenLen {
+			continue
+		}
+		if !seenKept {
+			origin = tok.pos
+			seenKept = true
+		}
+		phrase = append(phrase, phraseTerm{term: tok.text, delta: tok.pos - origin})
+	}
+	if len(phrase) < 2 {
+		return nil, badQueryf("phrase %q needs at least two terms", raw)
+	}
+	return &qNode{kind: qPhrase, field: field, phrase: phrase}, nil
 }

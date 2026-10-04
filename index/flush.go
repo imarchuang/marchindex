@@ -21,7 +21,7 @@ type FlushResult struct {
 // that became local doc i, so a successful commit can drop those rows.
 type frozen struct {
 	docs       []map[string]string
-	postings   map[string][]uint32
+	postings   map[string][]docPosting
 	origDocIDs []uint32
 	idAt       map[string]uint32
 }

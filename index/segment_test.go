@@ -8,28 +8,38 @@ import (
 )
 
 func TestDeltaEncodeRoundTrip(t *testing.T) {
-	ids := []uint32{0, 1, 2, 10, 1000}
-	blob, err := encodePostings(ids)
+	list := []docPosting{
+		{doc: 0, pos: []uint32{0}},
+		{doc: 1, pos: []uint32{0, 2}},
+		{doc: 2, pos: []uint32{1}},
+	}
+	blob, err := encodePostings(list)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// count=5, then 0, +1, +1, +8, +990. Each of those fits in one uvarint byte
-	// except 990 (two bytes: 0xDE 0x07).
-	if got, want := blob, []byte{5, 0, 1, 1, 8, 0xDE, 0x07}; string(got) != string(want) {
-		t.Fatalf("encoding = %v, want %v", got, want)
+	// count=3
+	// doc 0, freq 1, pos 0
+	// delta 1, freq 2, pos 0, delta 2
+	// delta 1, freq 1, pos 1
+	want := []byte{3, 0, 1, 0, 1, 2, 0, 2, 1, 1, 1}
+	if string(blob) != string(want) {
+		t.Fatalf("encoding = %v, want %v", blob, want)
 	}
 	got, err := decodePostings(blob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !equalU32(got, ids) {
-		t.Fatalf("decoded = %v, want %v", got, ids)
+	if !equalU32(postingIDs(got), []uint32{0, 1, 2}) {
+		t.Fatalf("docs = %v", postingIDs(got))
+	}
+	if !equalU32(got[1].pos, []uint32{0, 2}) {
+		t.Fatalf("doc 1 positions = %v", got[1].pos)
 	}
 
-	if _, err := encodePostings([]uint32{3, 3}); err == nil {
+	if _, err := encodePostings([]docPosting{{doc: 3, pos: []uint32{0}}, {doc: 3, pos: []uint32{1}}}); err == nil {
 		t.Fatal("expected strictly increasing docIDs")
 	}
-	if _, err := decodePostings([]byte{1, 1, 0}); err == nil {
+	if _, err := decodePostings([]byte{1, 0, 1, 0, 9}); err == nil {
 		t.Fatal("expected trailing byte error")
 	}
 }
@@ -87,13 +97,14 @@ func TestFlushCommitAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !equalU32(decoded["level:error"], []uint32{0}) {
-		t.Fatalf("level:error postings = %v, want local doc 0", decoded["level:error"])
+	if !equalU32(postingIDs(decoded["level:error"]), []uint32{0}) {
+		t.Fatalf("level:error postings = %v, want local doc 0", postingIDs(decoded["level:error"]))
 	}
-	if !equalU32(decoded["service:api"], []uint32{0, 1}) {
-		t.Fatalf("service:api postings = %v", decoded["service:api"])
+	if !equalU32(postingIDs(decoded["service:api"]), []uint32{0, 1}) {
+		t.Fatalf("service:api postings = %v", postingIDs(decoded["service:api"]))
 	}
-	// Both docs share service:api, so the on-disk list is doc 0 then delta 1.
+	// Both docs contain service:api once, at position 0. The docID list is
+	// doc 0 then delta 1, and each doc stores freq 1, pos 0.
 	off, length := termSlice(t, terms, "service:api")
 	blob := posts[off : off+uint64(length)]
 	if !equalU32(mustDecode(t, blob), []uint32{0, 1}) {
@@ -246,9 +257,9 @@ func termSlice(t *testing.T, terms []byte, want string) (off uint64, length uint
 
 func mustDecode(t *testing.T, blob []byte) []uint32 {
 	t.Helper()
-	ids, err := decodePostings(blob)
+	list, err := decodePostings(blob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ids
+	return postingIDs(list)
 }
