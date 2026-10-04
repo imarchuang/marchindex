@@ -21,9 +21,9 @@ Endpoints:
   POST   /indices/{name}/_doc          - index one JSON document (RAM; searchable without flush)
   POST   /indices/{name}/_flush        - freeze RAM into an immutable segment and commit it
   POST   /indices/{name}/_bulk         - NDJSON bulk (optional polish)
-  DELETE /indices/{name}/_doc/{id}     - mark deleted (bitset)
+  DELETE /indices/{name}/_doc/{id}     - set deleted.bits; search skips until merge drops the doc
   GET    /indices/{name}/_search       - boolean search, q= and limit= (default 10)
-  POST   /indices/{name}/_forcemerge   - compact segments now
+  POST   /indices/{name}/_forcemerge   - rewrite committed segments into one
   GET    /indices/{name}/_stats        - docs, segments, terms, deletes
 
 Query string (q), answered from committed segments and the unflushed RAM buffer:
@@ -123,6 +123,36 @@ func NewServer(mgr *index.Manager) http.Handler {
 			return
 		}
 		res, err := idx.Flush()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("DELETE /indices/{name}/_doc/{id}", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := openIndex(w, mgr, r.PathValue("name"))
+		if !ok {
+			return
+		}
+		res, err := idx.Delete(r.PathValue("id"))
+		if err != nil {
+			if errors.Is(err, index.ErrDocNotFound) {
+				writeError(w, http.StatusNotFound, "document not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("POST /indices/{name}/_forcemerge", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := openIndex(w, mgr, r.PathValue("name"))
+		if !ok {
+			return
+		}
+		res, err := idx.ForceMerge()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

@@ -48,7 +48,7 @@ func (idx *Index) Search(q string, limit int) (SearchResult, error) {
 	hits := make([]map[string]string, 0)
 	remaining := limit
 	for _, seg := range segs {
-		ids := node.eval(seg.postings, &lookups)
+		ids := seg.liveIDs(node.eval(seg.postings, &lookups))
 		for _, id := range ids {
 			if remaining == 0 {
 				break
