@@ -445,6 +445,81 @@ func TestFlushSearchAndRestart(t *testing.T) {
 	}
 }
 
+func TestBulkStatsAndTermFrequencyHTTP(t *testing.T) {
+	tmpDir := t.TempDir()
+	mgr, err := index.NewManager(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(mgr)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/indices/logs", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d", rec.Code)
+	}
+
+	body := "{\"level\":\"error\",\"message\":\"timeout once\"}\n\n{\"level\":\"error\",\"message\":\"timeout timeout\"}\nnot-json\n"
+	bulk := httptest.NewRecorder()
+	server.ServeHTTP(bulk, httptest.NewRequest(http.MethodPost, "/indices/logs/_bulk", strings.NewReader(body)))
+	if bulk.Code != http.StatusOK {
+		t.Fatalf("bulk: %d %s", bulk.Code, bulk.Body.String())
+	}
+	var bulkRes struct {
+		Errors bool `json:"errors"`
+		Items  []struct {
+			ID     string `json:"_id"`
+			Status int    `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(bulk.Body.Bytes(), &bulkRes); err != nil {
+		t.Fatal(err)
+	}
+	if !bulkRes.Errors || len(bulkRes.Items) != 3 || bulkRes.Items[0].Status != http.StatusCreated || bulkRes.Items[2].Status != http.StatusBadRequest {
+		t.Fatalf("bulk = %+v", bulkRes)
+	}
+
+	flush := httptest.NewRecorder()
+	server.ServeHTTP(flush, httptest.NewRequest(http.MethodPost, "/indices/logs/_flush", nil))
+	if flush.Code != http.StatusOK {
+		t.Fatalf("flush: %d %s", flush.Code, flush.Body.String())
+	}
+
+	stats := httptest.NewRecorder()
+	server.ServeHTTP(stats, httptest.NewRequest(http.MethodGet, "/indices/logs/_stats", nil))
+	if stats.Code != http.StatusOK {
+		t.Fatalf("stats: %d %s", stats.Code, stats.Body.String())
+	}
+	var st index.Stats
+	if err := json.Unmarshal(stats.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Docs != 2 || st.RamDocs != 0 || len(st.Segments) != 1 || st.Segments[0].Bytes == 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+
+	rankedRec := httptest.NewRecorder()
+	server.ServeHTTP(rankedRec, httptest.NewRequest(http.MethodGet, "/indices/logs/_search?q=timeout&sort=tf", nil))
+	if rankedRec.Code != http.StatusOK {
+		t.Fatalf("tf search: %d %s", rankedRec.Code, rankedRec.Body.String())
+	}
+	raw := rankedRec.Body.Bytes()
+	var ranked struct {
+		Hits []map[string]string `json:"hits"`
+	}
+	if err := json.Unmarshal(raw, &ranked); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranked.Hits) != 2 || ranked.Hits[0]["_id"] != "2" || ranked.Hits[0]["_score"] != "2" || ranked.Hits[1]["_score"] != "1" {
+		t.Fatalf("tf hits = %#v", ranked.Hits)
+	}
+
+	badSort := httptest.NewRecorder()
+	server.ServeHTTP(badSort, httptest.NewRequest(http.MethodGet, "/indices/logs/_search?q=timeout&sort=bm25", nil))
+	if badSort.Code != http.StatusBadRequest {
+		t.Fatalf("bad sort = %d", badSort.Code)
+	}
+}
+
 func TestPhraseSearchHTTP(t *testing.T) {
 	tmpDir := t.TempDir()
 	mgr, err := index.NewManager(tmpDir)

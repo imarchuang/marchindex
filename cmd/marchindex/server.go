@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/imarchuang/marchindex/index"
 )
@@ -20,11 +24,12 @@ Endpoints:
   GET    /indices                      - list indices + segment counts
   POST   /indices/{name}/_doc          - index one JSON document (RAM; searchable without flush)
   POST   /indices/{name}/_flush        - freeze RAM into an immutable segment and commit it
-  POST   /indices/{name}/_bulk         - NDJSON bulk (optional polish)
+  POST   /indices/{name}/_bulk         - NDJSON, one document object per line
   DELETE /indices/{name}/_doc/{id}     - set deleted.bits; search skips until merge drops the doc
   GET    /indices/{name}/_search       - boolean search, q= and limit= (default 10)
   POST   /indices/{name}/_forcemerge   - rewrite committed segments into one
-  GET    /indices/{name}/_stats        - docs, segments, terms, deletes
+  GET    /indices/{name}/_stats        - docs, segments, terms, deletes, byte sizes
+  GET    /indices/{name}/_search?sort=tf - order matches by term frequency (_score)
 
 Query string (q), answered from committed segments and the unflushed RAM buffer:
   level:error              term in field "level"
@@ -116,7 +121,22 @@ func NewServer(mgr *index.Manager) http.Handler {
 		if res.Replaced {
 			status = http.StatusOK
 		}
+		log.Printf("index %s doc %s seq %d", idx.Name(), res.ID, res.Seq)
 		writeJSON(w, status, res)
+	})
+
+	mux.HandleFunc("POST /indices/{name}/_bulk", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := openIndex(w, mgr, r.PathValue("name"))
+		if !ok {
+			return
+		}
+		res, err := bulkIndex(idx, r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		log.Printf("bulk %s items %d errors %v", idx.Name(), len(res.Items), res.Errors)
+		writeJSON(w, http.StatusOK, res)
 	})
 
 	mux.HandleFunc("POST /indices/{name}/_flush", func(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +149,7 @@ func NewServer(mgr *index.Manager) http.Handler {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("flush %s segment %s docs %d", idx.Name(), res.Segment, res.Docs)
 		writeJSON(w, http.StatusOK, res)
 	})
 
@@ -138,6 +159,9 @@ func NewServer(mgr *index.Manager) http.Handler {
 			return
 		}
 		res, err := idx.Delete(r.PathValue("id"))
+		if err == nil {
+			log.Printf("delete %s doc %s copies %d", idx.Name(), res.ID, res.Deleted)
+		}
 		if err != nil {
 			if errors.Is(err, index.ErrDocNotFound) {
 				writeError(w, http.StatusNotFound, "document not found")
@@ -159,6 +183,20 @@ func NewServer(mgr *index.Manager) http.Handler {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("merge %s merged %v segments %d", idx.Name(), res.Merged, res.SegmentsAfter)
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("GET /indices/{name}/_stats", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := openIndex(w, mgr, r.PathValue("name"))
+		if !ok {
+			return
+		}
+		res, err := idx.Stats()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, res)
 	})
 
@@ -176,7 +214,19 @@ func NewServer(mgr *index.Manager) http.Handler {
 			}
 			limit = n
 		}
-		res, err := idx.Search(r.URL.Query().Get("q"), limit)
+		var (
+			res index.SearchResult
+			err error
+		)
+		switch r.URL.Query().Get("sort") {
+		case "", "doc":
+			res, err = idx.Search(r.URL.Query().Get("q"), limit)
+		case "tf":
+			res, err = idx.SearchTF(r.URL.Query().Get("q"), limit)
+		default:
+			writeError(w, http.StatusBadRequest, "invalid sort")
+			return
+		}
 		if err != nil {
 			if errors.Is(err, index.ErrBadQuery) {
 				writeError(w, http.StatusBadRequest, err.Error())
@@ -185,6 +235,7 @@ func NewServer(mgr *index.Manager) http.Handler {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		log.Printf("search %s q %q hits %d segments %d lookups %d", idx.Name(), r.URL.Query().Get("q"), len(res.Hits), res.SegmentsSearched, res.PostingsLookups)
 		writeJSON(w, http.StatusOK, res)
 	})
 
@@ -208,8 +259,64 @@ func openIndex(w http.ResponseWriter, mgr *index.Manager, name string) (*index.I
 	return idx, true
 }
 
+type bulkItem struct {
+	ID     string `json:"_id,omitempty"`
+	Seq    uint32 `json:"_seq,omitempty"`
+	Status int    `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+type bulkResult struct {
+	TookMs int64      `json:"took_ms"`
+	Errors bool       `json:"errors"`
+	Items  []bulkItem `json:"items"`
+}
+
+func bulkIndex(idx *index.Index, body io.Reader) (bulkResult, error) {
+	start := time.Now()
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	out := bulkResult{Items: []bulkItem{}}
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields, id, err := documentFromJSON(line)
+		if err != nil {
+			out.Errors = true
+			out.Items = append(out.Items, bulkItem{Status: http.StatusBadRequest, Error: err.Error()})
+			continue
+		}
+		res, err := idx.IndexDocument(id, fields)
+		if err != nil {
+			out.Errors = true
+			out.Items = append(out.Items, bulkItem{Status: http.StatusInternalServerError, Error: err.Error()})
+			continue
+		}
+		status := http.StatusCreated
+		if res.Replaced {
+			status = http.StatusOK
+		}
+		out.Items = append(out.Items, bulkItem{ID: res.ID, Seq: res.Seq, Status: status})
+	}
+	if err := sc.Err(); err != nil {
+		return bulkResult{}, fmt.Errorf("read bulk body")
+	}
+	out.TookMs = time.Since(start).Milliseconds()
+	return out, nil
+}
+
 func readDocument(r *http.Request) (map[string]string, string, error) {
-	dec := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid JSON body")
+	}
+	return documentFromJSON(string(data))
+}
+
+func documentFromJSON(line string) (map[string]string, string, error) {
+	dec := json.NewDecoder(strings.NewReader(line))
 	dec.UseNumber()
 	var raw map[string]any
 	if err := dec.Decode(&raw); err != nil {
